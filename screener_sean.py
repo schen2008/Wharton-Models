@@ -1,89 +1,136 @@
 #!/usr/bin/env python3
-# industry_grouped_growth_tilted_fast.py
+# screener_sean.py
 #
-# ✔ FAST
-# ✔ Clean console (no delisted warnings)
-# ✔ Skips bad tickers instantly
-# ✔ Cache + --refresh
-# ✔ PNG chart + Excel Top 10
-#
-# Requirements:
-#   pip install yfinance pandas numpy openpyxl tqdm matplotlib
+# ✅ No terminal commands needed
+# ✅ Output always saved safely (no FileNotFound errors)
+# ✅ Editable flags: USE_CACHE, SECTOR_FILTER
+# ✅ Table-based scoring (Profitability, Valuation, Growth, Risk)
+# ✅ Top 10 overall + Top 10 per sector + breakdown printout
 
 import io
 import os
 import re
-import sys
-import time
 import pickle
 import urllib.request
 import warnings
-from typing import List
-
-warnings.filterwarnings("ignore")   # <-- remove yfinance spam
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+
+# tqdm fallback (so missing tqdm won't break code)
+try:
+    from tqdm import tqdm
+except:
+    def tqdm(x, **k): return x
+
 import yfinance as yf
 
-# ------------------------------------------------------
-# SETTINGS
-# ------------------------------------------------------
-CACHE_FILE   = "fundamentals_cache.pkl"
-SKIP_LOG     = "skipped_symbols.txt"
-OUT_EXCEL    = "growth_fast_top10.xlsx"
-CHART_FILE   = "ranked_results_chart.png"
+# ============================================
+# USER EDITABLE SETTINGS
+# ============================================
+USE_CACHE = True          # True = load cached fundamentals; False = refresh from Yahoo
+SECTOR_FILTER = None      # e.g., "Technology", or None for ALL sectors
 
-USE_CACHE    = True     # set False or run with --refresh to refetch
-EXPORT_CHART = True
+# ============================================
+# GUARANTEED OUTPUT DIRECTORY (works even if parents missing)
+# ============================================
+from pathlib import Path
+
+try:
+    # Try to save right next to script / current working directory
+    OUTPUT_DIR = Path(os.getcwd()) / "results"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Fallback to Documents
+    OUTPUT_DIR = Path.home() / "Documents" / "Wharton-Models" / "results"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_FILE = OUTPUT_DIR / "fundamentals_cache.pkl"
+SKIP_LOG   = OUTPUT_DIR / "skipped_symbols.txt"# ============================================
+# FILTER RULES
+# ============================================
+MIN_MARKET_CAP = 2_000_000_000
+MIN_PRICE      = 5.0
 
 EXCHANGES_ALLOWED = {"NYSE", "NasdaqGS", "NasdaqGM", "NasdaqCM"}
 SECTORS_ALLOWED   = {"Financials", "Industrials", "Energy", "Materials", "Technology", "Consumer Staples"}
-MIN_MARKET_CAP    = 2_000_000_000
-MIN_PRICE         = 5.0
+BAD_SUFFIXES      = (".U", ".W", ".R", "-U", "-W", "-R")
 
-# Weights:
-W_PROF = 26
-W_VAL  = 26
-W_GROW = 18
-W_RISK = 30
-
-PROF_METRICS = ["roe", "profit_margin", "operating_margin", "roa"]
-VAL_METRICS  = ["fcf_yield", "peg_effective", "ev_ebitda", "pb"]
-RISK_METRICS = ["debt_to_equity", "quick_ratio", "beta"]
-
-BAD_SUFFIXES = (".U", ".W", ".R", "-U", "-W", "-R")
-
-# ------------------------------------------------------
-def safe_div(a, b):
-    try:
-        if b is None or b == 0 or pd.isna(b):
-            return np.nan
-        return a / b
-    except:
-        return np.nan
-
-def normalize_symbol_to_yahoo(sym: str) -> str:
-    s = sym.strip()
-
-    # convert BRK.B → BRK-B, RDS.A → RDS-A
-    if "." in s:
-        s = s.replace(".", "-")
-
-    # convert IVR$C → IVR-PRC
+# ============================================
+# Helpers
+# ============================================
+def normalize_symbol(sym):
+    if sym is None:
+        return ""
+    s = str(sym).strip().replace(" ", "")
+    if "." in s: s = s.replace(".", "-")
     if "$" in s:
         base, ser = s.split("$", 1)
         ser = re.sub(r"[^A-Za-z0-9]", "", ser).upper()
-        if ser:
-            return f"{base}-PR{ser}"
-        return base
+        s = f"{base}-PR{ser}" if ser else base
+    return s
 
-    return s.replace(" ", "")
+def safe_div(a, b):
+    if a is None or b is None: return None
+    try:
+        if pd.isna(a) or pd.isna(b) or b == 0: return None
+    except: pass
+    try: return a / b
+    except: return None
 
-# ------------------------------------------------------
-def fetch_symbol_lists() -> pd.DataFrame:
+def to_num(v):
+    if v is None: return None
+    try:
+        if pd.isna(v): return None
+    except: pass
+    try: return float(v)
+    except: return None
+
+# ============================================
+# TABLE-BASED SCORING
+# ============================================
+def score_profitability(roe, pm, om, roa):
+    vals = [to_num(roe), to_num(pm), to_num(om), to_num(roa)]
+    if any(v is not None and v < 0 for v in vals): return 1
+    if all(v is not None and v > 0.15 for v in vals): return 6
+    if all(v is not None and v > 0.05 for v in vals): return 3
+    return 2
+
+def score_valuation(fcf_yield, peg, ev_ebitda, pb):
+    fy = to_num(fcf_yield)
+    pg = to_num(peg)
+    ee = to_num(ev_ebitda)
+    pbv = to_num(pb)
+    score = 0
+    if fy is not None and fy > 0.05: score += 2
+    if pg is not None and pg < 1: score += 2
+    if ee is not None and ee < 10: score += 1
+    if pbv is not None and pbv < 3: score += 1
+    return max(1, min(score, 6))
+
+def score_growth(eps_growth):
+    g = to_num(eps_growth)
+    if g is None: return 9
+    if g < 0: return 1
+    if g < 0.05: return 9
+    if g > 0.20: return 18
+    return 12
+
+def score_risk(dte, qr, beta):
+    d = to_num(dte)
+    q = to_num(qr)
+    b = to_num(beta)
+    score = 0
+    if d is not None and d < 1: score += 4
+    if q is not None and q > 1: score += 3
+    if b is not None and b < 1: score += 3
+    return max(1, min(score, 10))
+
+# ============================================
+# NASDAQ symbol list
+# ============================================
+def fetch_symbol_lists():
     nasdaq_url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
     other_url  = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
 
@@ -94,8 +141,8 @@ def fetch_symbol_lists() -> pd.DataFrame:
     nasdaq = load(nasdaq_url)
     other  = load(other_url)
 
-    nasdaq = nasdaq[nasdaq["Test Issue"] == "N"].copy()
-    other  = other[(other["Test Issue"] == "N") & (other["Exchange"] == "N")].copy()
+    nasdaq = nasdaq[nasdaq["Test Issue"] == "N"]
+    other  = other[(other["Test Issue"] == "N") & (other["Exchange"] == "N")]
 
     nasdaq["Symbol"]    = nasdaq["Symbol"].astype(str).str.strip()
     other["ACT Symbol"] = other["ACT Symbol"].astype(str).str.strip()
@@ -103,41 +150,41 @@ def fetch_symbol_lists() -> pd.DataFrame:
     df = pd.concat([
         pd.DataFrame({"symbol_raw": nasdaq["Symbol"]}),
         pd.DataFrame({"symbol_raw": other["ACT Symbol"]})
-    ], ignore_index=True).drop_duplicates("symbol_raw")
+    ], ignore_index=True).drop_duplicates()
 
-    # remove known non-stock classes
-    df = df[~df["symbol_raw"].str.endswith(BAD_SUFFIXES)].copy()
+    df["symbol_raw"] = df["symbol_raw"].astype(str).str.strip()
+    df = df[~df["symbol_raw"].str.endswith(BAD_SUFFIXES, na=False)]
 
-    df["symbol"] = df["symbol_raw"].apply(normalize_symbol_to_yahoo)
+    df["symbol"] = df["symbol_raw"].apply(normalize_symbol)
+    df = df[df["symbol"] != ""]
     return df.drop_duplicates("symbol")
 
-# ------------------------------------------------------
-def fetch_fundamentals(symbols: List[str]) -> pd.DataFrame:
+# ============================================
+# FUNDAMENTALS (with caching)
+# ============================================
+def fetch_fundamentals(symbols):
     if USE_CACHE and os.path.exists(CACHE_FILE):
-        print("✅ Loading cached fundamentals...")
+        print("✅ Loaded cached fundamentals")
         return pickle.load(open(CACHE_FILE, "rb"))
 
-    print("⏳ Downloading fundamentals from Yahoo Finance...")
-    rows = []
-    skipped = []
+    print("⏳ Downloading fundamentals...")
+    rows, skipped = [], []
 
     for sym in tqdm(symbols, desc="Pulling", unit="stk"):
-        # quick skip of junk tickers
-        if sym.endswith(BAD_SUFFIXES):
-            skipped.append((sym, "unit/warrant/rights"))
+        ysym = normalize_symbol(sym)
+        if not ysym or any(ysym.endswith(suf) for suf in BAD_SUFFIXES):
+            skipped.append((ysym, "bad suffix"))
             continue
-
-        ysym = normalize_symbol_to_yahoo(sym)
 
         try:
             info = yf.Ticker(ysym).info
         except:
-            skipped.append((ysym, "info fetch failed"))
+            skipped.append((ysym, "info failure"))
             continue
 
-        price = info.get("regularMarketPrice") or info.get("previousClose")
-        if price is None or pd.isna(price):
-            skipped.append((ysym, "no price / likely delisted"))
+        price = to_num(info.get("regularMarketPrice") or info.get("previousClose"))
+        if price is None:
+            skipped.append((ysym, "no price"))
             continue
 
         rows.append({
@@ -147,151 +194,148 @@ def fetch_fundamentals(symbols: List[str]) -> pd.DataFrame:
             "exchange": info.get("exchange"),
             "sector": info.get("sector"),
             "industry": info.get("industry") or "Unknown",
-            "marketCap": info.get("marketCap"),
-            "roe": info.get("returnOnEquity"),
-            "profit_margin": info.get("profitMargins"),
-            "operating_margin": info.get("operatingMargins"),
-            "roa": info.get("returnOnAssets"),
-            "fcf_yield": safe_div(info.get("freeCashflow"), info.get("marketCap")),
-            "ev_ebitda": safe_div(info.get("enterpriseValue"), info.get("ebitda")),
-            "peg_effective": info.get("pegRatio") or safe_div(info.get("trailingPE"), info.get("earningsGrowth")),
-            "pb": info.get("priceToBook"),
-            "eps_growth": info.get("earningsGrowth"),
-            "debt_to_equity": info.get("debtToEquity"),
-            "quick_ratio": info.get("quickRatio"),
-            "beta": info.get("beta"),
+            "marketCap": to_num(info.get("marketCap")),
+
+            "roe": to_num(info.get("returnOnEquity")),
+            "profit_margin": to_num(info.get("profitMargins")),
+            "operating_margin": to_num(info.get("operatingMargins")),
+            "roa": to_num(info.get("returnOnAssets")),
+
+            "fcf_yield": safe_div(to_num(info.get("freeCashflow")), to_num(info.get("marketCap"))),
+            "peg": to_num(info.get("pegRatio")),
+            "ev_ebitda": safe_div(to_num(info.get("enterpriseValue")), to_num(info.get("ebitda"))),
+            "pb": to_num(info.get("priceToBook")),
+
+            "eps_growth": to_num(info.get("earningsGrowth")),
+
+            "debt_to_equity": to_num(info.get("debtToEquity")),
+            "quick_ratio": to_num(info.get("quickRatio")),
+            "beta": to_num(info.get("beta")),
         })
 
     df = pd.DataFrame(rows)
-    pickle.dump(df, open(CACHE_FILE, "wb"))
-    print(f"✅ Saved cache → {CACHE_FILE}")
+
+    try:
+        pickle.dump(df, open(CACHE_FILE, "wb"))
+        print(f"✅ Cache saved → {CACHE_FILE}")
+    except:
+        print("⚠ Could not save cache file")
 
     if skipped:
-        with open(SKIP_LOG, "w") as f:
-            for s, r in skipped:
-                f.write(f"{s}\t{r}\n")
-        print(f"⚠️ Skipped {len(skipped)} bad symbols → {SKIP_LOG}")
+        try:
+            with open(SKIP_LOG, "w", encoding="utf-8") as f:
+                for s, r in skipped:
+                    f.write(f"{s}\t{r}\n")
+            print(f"⚠ Skipped {len(skipped)} symbols → {SKIP_LOG}")
+        except:
+            print("⚠ Could not write skip log")
 
     return df
 
-# ------------------------------------------------------
-def normalize_exchanges(df):
-    conv = {"NYQ":"NYSE","NYSE":"NYSE","NMS":"NasdaqGS","NGM":"NasdaqGM","NCM":"NasdaqCM"}
-    df["exchange_std"] = df["exchange"].map(conv).fillna(df["exchange"])
-    return df
-
+# ============================================
+# FILTER + SCORE
+# ============================================
 def apply_filters(df):
-    df = normalize_exchanges(df)
+    conv = {
+        "NYQ": "NYSE",
+        "NYSE": "NYSE",
+        "NMS": "NasdaqGS",
+        "NasdaqGS": "NasdaqGS",
+        "NGM": "NasdaqGM",
+        "NasdaqGM": "NasdaqGM",
+        "NCM": "NasdaqCM",
+        "NasdaqCM": "NasdaqCM",
+    }
+
+    df["exchange_std"] = df["exchange"].map(conv).fillna(df["exchange"])
+
     f = df[
-        (df["marketCap"] >= MIN_MARKET_CAP) &
-        (df["price"] >= MIN_PRICE) &
+        (df["marketCap"].apply(lambda x: x is not None and x >= MIN_MARKET_CAP)) &
+        (df["price"].apply(lambda x: x is not None and x >= MIN_PRICE)) &
         (df["exchange_std"].isin(EXCHANGES_ALLOWED)) &
         (df["sector"].isin(SECTORS_ALLOWED))
     ].copy()
-    f["industry_group"] = f["industry"].fillna("Unknown")
+
     return f
 
-def pct_group(df, col, invert=False):
-    result = pd.Series(np.nan, index=df.index)
-    for ind, g in df.groupby("industry_group"):
-        ok = g[col].notna()
-        if ok.sum() > 0:
-            pct = g.loc[ok, col].rank(pct=True)
-            result.loc[pct.index] = (1 - pct) if invert else pct
-    return result
-
-# ------------------------------------------------------
 def score(df):
     out = df.copy()
 
-    for m in PROF_METRICS:
-        out[f"pct_{m}"] = pct_group(out, m)
+    out["profitability"] = out.apply(lambda r: score_profitability(
+        r["roe"], r["profit_margin"], r["operating_margin"], r["roa"]), axis=1)
 
-    out["pct_fcf_yield"]     = pct_group(out, "fcf_yield")
-    out["pct_peg_effective"] = pct_group(out, "peg_effective", invert=True)
-    out["pct_ev_ebitda"]     = pct_group(out, "ev_ebitda", invert=True)
-    out["pct_pb"]            = pct_group(out, "pb", invert=True)
+    out["valuation"] = out.apply(lambda r: score_valuation(
+        r["fcf_yield"], r["peg"], r["ev_ebitda"], r["pb"]), axis=1)
 
-    out["pct_eps_growth"] = pct_group(out, "eps_growth")
+    out["growth"] = out["eps_growth"].apply(score_growth)
 
-    out["pct_debt_to_equity"] = pct_group(out, "debt_to_equity", invert=True)
-    out["pct_quick_ratio"]    = pct_group(out, "quick_ratio")
-    out["pct_beta"]           = pct_group(out, "beta", invert=True)
-
-    out["prof_raw"]   = np.nanmean([1 + out[f"pct_{m}"] * 5 for m in PROF_METRICS], axis=0)
-    out["val_raw"]    = np.nanmean([1 + out[f"pct_{m}"] * 5 for m in VAL_METRICS], axis=0)
-    out["growth_raw"] = 1 + out["pct_eps_growth"] * 17
-    out["risk_raw"]   = np.nanmean([
-        1 + out["pct_debt_to_equity"] * 9,
-        1 + out["pct_quick_ratio"] * 9,
-        1 + out["pct_beta"] * 9
-    ], axis=0)
+    out["risk"] = out.apply(lambda r: score_risk(
+        r["debt_to_equity"], r["quick_ratio"], r["beta"]), axis=1)
 
     out["score"] = (
-        out["prof_raw"] * (W_PROF/6) +
-        out["val_raw"]  * (W_VAL/6) +
-        out["growth_raw"] * (W_GROW/18) +
-        out["risk_raw"] * (W_RISK/10)
+        out["profitability"] * (26/6) +
+        out["valuation"]     * (26/6) +
+        out["growth"]        * (18/18) +
+        out["risk"]          * (30/10)
     )
 
     return out.sort_values("score", ascending=False).reset_index(drop=True)
 
-# ------------------------------------------------------
-def show_terminal_chart(df):
-    print("\n=== TOP 20 BREAKDOWN ===")
-    for _, row in df.head(20).iterrows():
-        print(f"\n{row['symbol']} | Score: {row['score']:.2f}")
-        print(f"  Profitability: {row['prof_raw']:.2f}/6 ")
-        print(f"     → ROE: {row['roe']}, Profit Margin: {row['profit_margin']}, Operating Margin: {row['operating_margin']}, ROA: {row['roa']}")
-        print(f"  Valuation:     {row['val_raw']:.2f}/6 ")
-        print(f"     → FCF Yield: {row['fcf_yield']}, PEG: {row['peg_effective']}, EV/EBITDA: {row['ev_ebitda']}, P/B: {row['pb']}")
-        print(f"  Growth:        {row['growth_raw']:.2f}/18 (EPS Growth: {row['eps_growth']})")
-        print(f"  Risk/Liquidity:{row['risk_raw']:.2f}/10 ")
-        print(f"     → Debt/Equity: {row['debt_to_equity']}, Quick Ratio: {row['quick_ratio']}, Beta: {row['beta']}")
+# ============================================
+# PRINT BREAKDOWN
+# ============================================
+def print_top10_breakdown(df):
+    print("\n=== TOP 10 BREAKDOWN ===")
+    for _, r in df.head(10).iterrows():
+        print(f"\n{r['symbol']} — Score: {r['score']:.2f}")
+        print(f"  Profitability: {r['profitability']}/6")
+        print(f"    ROE: {r['roe']}, PM: {r['profit_margin']}, OM: {r['operating_margin']}, ROA: {r['roa']}")
+        print(f"  Valuation: {r['valuation']}/6")
+        print(f"    FCF Yield: {r['fcf_yield']}, PEG: {r['peg']}, EV/EBITDA: {r['ev_ebitda']}, P/B: {r['pb']}")
+        print(f"  Growth: {r['growth']}/18 (EPS Growth: {r['eps_growth']})")
+        print(f"  Risk/Liquidity: {r['risk']}/10")
+        print(f"    D/E: {r['debt_to_equity']}, Quick: {r['quick_ratio']}, Beta: {r['beta']}")
 
-def export_full_chart(df):
-    if not EXPORT_CHART:
-        return
-    plt.figure(figsize=(12, 6))
-    plt.bar(df["symbol"], df["score"])
-    plt.xticks(rotation=90)
-    plt.title("Ranked Stocks")
-    plt.ylabel("Score")
-    plt.tight_layout()
-    plt.savefig(CHART_FILE)
-    print(f"📈 Chart saved → {CHART_FILE}")
-
-# ------------------------------------------------------
+# ============================================
+# MAIN
+# ============================================
 def main():
-    global USE_CACHE
-    if "--refresh" in sys.argv:
-        USE_CACHE = False
-
-    print("Building universe...")
     universe = fetch_symbol_lists()
     symbols = universe["symbol"].tolist()
 
-    print("Getting fundamentals...")
     df = fetch_fundamentals(symbols)
+    filtered = apply_filters(df)
 
-    print("Applying filters...")
-    f = apply_filters(df)
-    if f.empty:
-        print("❌ No valid stocks passed filters")
+    if filtered.empty:
+        print("❌ No stocks passed filters.")
         return
 
-    print("Scoring...")
-    ranked = score(f)
+    # Single sector only?
+    if SECTOR_FILTER is not None:
+        s = filtered[filtered["sector"] == SECTOR_FILTER]
+        if s.empty:
+            print(f"❌ No stocks in sector: {SECTOR_FILTER}")
+            return
 
-    print("\n✅ Saving CSV files...")
-    ranked.to_csv("all_ranked.csv", index=False)
-    ranked.head(10).to_csv("top10.csv", index=False)
-    print("✅ Saved: all_ranked.csv and top10.csv")
+        ranked = score(s)
+        fpath = os.path.join(OUTPUT_DIR, f"top10_{SECTOR_FILTER.replace(' ', '_')}.csv")
+        ranked.to_csv(fpath, index=False)
+        print_top10_breakdown(ranked)
+        print(f"\n✅ DONE — saved → {fpath}")
+        return
 
-    show_terminal_chart(ranked)
-    export_full_chart(ranked)
+    # ALL sectors
+    ranked = score(filtered)
+    ranked.to_csv(os.path.join(OUTPUT_DIR, "all_ranked.csv"), index=False)
+    ranked.head(10).to_csv(os.path.join(OUTPUT_DIR, "top10.csv"), index=False)
 
-    print("\n✅ DONE")
+    # Top 10 per sector
+    for sector, g in ranked.groupby("sector", sort=False):
+        fpath = os.path.join(OUTPUT_DIR, f"top10_{sector.replace(' ', '_')}.csv")
+        g.head(10).to_csv(fpath, index=False)
+
+    print_top10_breakdown(ranked)
+    print(f"\n✅ DONE — files saved in {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()
