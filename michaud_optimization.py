@@ -6,6 +6,19 @@ from scipy.stats import multivariate_normal, wishart, invwishart
 import warnings
 warnings.filterwarnings('ignore')
 
+"""
+*****
+******
+*******
+********
+*********
+NOTE: PLEASE READ EVERY COMMIT MEESAGE AND THE EXTENDED COMMIT DESCRIPTION BY CLICKING ON THE COMMIT MESSAGE ABOVE
+*********
+********
+*******
+******
+*****
+"""
 
 class MichaudOptimization:
     """
