@@ -6,19 +6,6 @@ from scipy.stats import multivariate_normal, wishart, invwishart
 import warnings
 warnings.filterwarnings('ignore')
 
-"""
-*****
-******
-*******
-********
-*********
-NOTE: PLEASE READ EVERY COMMIT MEESAGE AND THE EXTENDED COMMIT DESCRIPTION BY CLICKING ON THE COMMIT MESSAGE ABOVE
-*********
-********
-*******
-******
-*****
-"""
 
 class MichaudOptimization:
     """
@@ -32,7 +19,8 @@ class MichaudOptimization:
     This model properly accounts for that uncertainty.
     """
     
-    def __init__(self, returns_data, num_simulations=500, num_portfolios=100):
+    def __init__(self, returns_data, num_simulations=500, num_portfolios=100,
+                 risk_free_rate=0.0, random_state=None):
         """
         Initialize the Michaud Optimization Model
         
@@ -44,6 +32,10 @@ class MichaudOptimization:
             Number of Monte Carlo simulations to run (default: 500)
         num_portfolios : int
             Number of portfolios along the efficient frontier (default: 100)
+        risk_free_rate : float
+            Risk-free rate expressed in the same units as returns (default: 0.0)
+        random_state : int or numpy.random.Generator
+            Seed or generator for reproducibility (default: None)
         """
         self.returns_data = returns_data
         self.num_simulations = num_simulations
@@ -51,6 +43,8 @@ class MichaudOptimization:
         self.num_assets = returns_data.shape[1]
         self.num_observations = len(returns_data)
         self.asset_names = returns_data.columns.tolist()
+        self.risk_free_rate = risk_free_rate
+        self.rng = np.random.default_rng(random_state)
         
         # Calculate sample statistics from historical data
         self.sample_mean_returns = returns_data.mean().values
@@ -65,6 +59,19 @@ class MichaudOptimization:
         self.resampled_returns = None
         self.resampled_risks = None
         self.target_returns = None
+        self.base_frontier_weights = None
+        self.base_frontier_returns = None
+        self.base_frontier_risks = None
+
+    def _normalize_weights(self, weights):
+        """
+        Project numerical optimizer output back onto the feasible simplex.
+        """
+        weights = np.clip(weights, 0, None)
+        total = np.sum(weights)
+        if total <= 0:
+            return None
+        return weights / total
         
     def generate_bayesian_monte_carlo_sample(self):
         """
@@ -97,12 +104,19 @@ class MichaudOptimization:
         # Sample from Inverse-Wishart distribution
         # Note: scipy's invwishart uses df and scale parameterization
         try:
-            simulated_cov = invwishart.rvs(df=degrees_of_freedom, scale=scale_matrix)
-        except:
-            # If Inverse-Wishart fails (can happen with numerical issues),
-            # fall back to sampling from Wishart and inverting
-            wishart_sample = wishart.rvs(df=degrees_of_freedom, scale=self.sample_cov_matrix)
-            simulated_cov = wishart_sample / (T - 1)
+            simulated_cov = invwishart.rvs(
+                df=degrees_of_freedom,
+                scale=scale_matrix,
+                random_state=self.rng
+            )
+        except Exception:
+            # Fall back to sampling a precision matrix and invert so distribution stays consistent
+            precision_sample = wishart.rvs(
+                df=degrees_of_freedom,
+                scale=np.linalg.pinv(scale_matrix),
+                random_state=self.rng
+            )
+            simulated_cov = np.linalg.inv(precision_sample)
         
         # Ensure the covariance matrix is symmetric and positive definite
         simulated_cov = (simulated_cov + simulated_cov.T) / 2
@@ -119,7 +133,8 @@ class MichaudOptimization:
         mean_covariance = simulated_cov / T
         simulated_mean = multivariate_normal.rvs(
             mean=self.sample_mean_returns,
-            cov=mean_covariance
+            cov=mean_covariance,
+            random_state=self.rng
         )
         
         return simulated_mean, simulated_cov
@@ -148,7 +163,8 @@ class MichaudOptimization:
         portfolio_risk = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
         return portfolio_return, portfolio_risk
     
-    def optimize_portfolio_for_target_return(self, target_return, mean_returns, cov_matrix):
+    def optimize_portfolio_for_target_return(self, target_return, mean_returns, cov_matrix,
+                                             initial_weights=None):
         """
         Optimize portfolio to minimize risk for a given target return
         
@@ -166,39 +182,55 @@ class MichaudOptimization:
         optimal_weights : numpy array
             Optimal portfolio weights, or None if optimization fails
         """
-        # Objective function: minimize portfolio variance
         def portfolio_variance(weights):
             return np.dot(weights.T, np.dot(cov_matrix, weights))
         
-        # Constraints
-        constraints = [
-            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},  # Weights sum to 1
-            {'type': 'eq', 'fun': lambda w: np.dot(w, mean_returns) - target_return}  # Target return
-        ]
+        if initial_weights is None:
+            initial_weights = np.array([1.0 / self.num_assets] * self.num_assets)
+        else:
+            initial_weights = self._normalize_weights(initial_weights)
+            if initial_weights is None:
+                initial_weights = np.array([1.0 / self.num_assets] * self.num_assets)
         
-        # Bounds: weights between 0 and 1 (long-only portfolio)
         bounds = tuple((0, 1) for _ in range(self.num_assets))
+        sum_constraint = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}
+        exact_return_constraint = {'type': 'eq', 'fun': lambda w: np.dot(w, mean_returns) - target_return}
         
-        # Initial guess: equal weights
-        initial_weights = np.array([1.0 / self.num_assets] * self.num_assets)
-        
-        # Optimize
         result = minimize(
             portfolio_variance,
             initial_weights,
             method='SLSQP',
             bounds=bounds,
-            constraints=constraints,
+            constraints=[sum_constraint, exact_return_constraint],
             options={'maxiter': 1000, 'ftol': 1e-9}
         )
         
         if result.success:
-            # Ensure weights are non-negative and sum to 1 (numerical cleanup)
-            weights = np.maximum(result.x, 0)
-            weights = weights / np.sum(weights)
-            return weights
-        else:
-            return None
+            weights = self._normalize_weights(result.x)
+            if weights is not None:
+                achieved_return = np.dot(weights, mean_returns)
+                if np.isclose(achieved_return, target_return, rtol=1e-4, atol=1e-6):
+                    return weights
+        
+        # Fallback: allow small overshoot on the target return if equality solver struggled
+        relaxed_constraint = {'type': 'ineq', 'fun': lambda w: np.dot(w, mean_returns) - target_return}
+        result = minimize(
+            portfolio_variance,
+            initial_weights,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=[sum_constraint, relaxed_constraint],
+            options={'maxiter': 1000, 'ftol': 1e-9}
+        )
+        
+        if result.success:
+            weights = self._normalize_weights(result.x)
+            if weights is not None:
+                achieved_return = np.dot(weights, mean_returns)
+                if achieved_return >= target_return - 1e-6:
+                    return weights
+        
+        return None
     
     def optimize_minimum_variance_portfolio(self, mean_returns, cov_matrix):
         """
@@ -236,11 +268,11 @@ class MichaudOptimization:
         )
         
         if result.success:
-            weights = np.maximum(result.x, 0)
-            weights = weights / np.sum(weights)
-            return weights
-        else:
-            return np.array([1.0 / self.num_assets] * self.num_assets)
+            weights = self._normalize_weights(result.x)
+            if weights is not None:
+                return weights
+        
+        return np.array([1.0 / self.num_assets] * self.num_assets)
     
     def compute_efficient_frontier_for_sample(self, mean_returns, cov_matrix, target_returns):
         """
@@ -268,22 +300,26 @@ class MichaudOptimization:
         frontier_returns = []
         frontier_risks = []
         
+        previous_weights = None
+        
         for target in target_returns:
-            weights = self.optimize_portfolio_for_target_return(target, mean_returns, cov_matrix)
+            weights = self.optimize_portfolio_for_target_return(
+                target,
+                mean_returns,
+                cov_matrix,
+                initial_weights=previous_weights
+            )
             
-            if weights is not None:
-                ret, risk = self.portfolio_performance(weights, mean_returns, cov_matrix)
-                frontier_weights.append(weights)
-                frontier_returns.append(ret)
-                frontier_risks.append(risk)
-            else:
-                # If optimization failed, try to find minimum variance portfolio
-                # and use it as a placeholder
-                min_var_weights = self.optimize_minimum_variance_portfolio(mean_returns, cov_matrix)
-                ret, risk = self.portfolio_performance(min_var_weights, mean_returns, cov_matrix)
-                frontier_weights.append(min_var_weights)
-                frontier_returns.append(ret)
-                frontier_risks.append(risk)
+            if weights is None:
+                raise ValueError(
+                    f"Efficient frontier solver failed for target return={target:.8f}"
+                )
+            
+            ret, risk = self.portfolio_performance(weights, mean_returns, cov_matrix)
+            frontier_weights.append(weights)
+            frontier_returns.append(ret)
+            frontier_risks.append(risk)
+            previous_weights = weights
         
         return frontier_weights, frontier_returns, frontier_risks
     
@@ -305,18 +341,40 @@ class MichaudOptimization:
         print(f"Portfolios per frontier: {self.num_portfolios}")
         print("-" * 60)
         
-        # Determine the range of target returns
-        # Use a range based on the sample estimates
-        min_return = np.min(self.sample_mean_returns)
-        max_return = np.max(self.sample_mean_returns)
+        # Determine a feasible range of target returns
+        min_var_weights = self.optimize_minimum_variance_portfolio(
+            self.sample_mean_returns,
+            self.sample_cov_matrix
+        )
+        min_return = np.dot(min_var_weights, self.sample_mean_returns)
         
-        # Expand the range slightly to ensure we cover the full frontier
-        return_range = max_return - min_return
-        min_return = min_return - 0.1 * return_range
-        max_return = max_return + 0.1 * return_range
+        max_asset_return = np.max(self.sample_mean_returns)
+        max_return_weights = self.optimize_portfolio_for_target_return(
+            max_asset_return,
+            self.sample_mean_returns,
+            self.sample_cov_matrix
+        )
+        if max_return_weights is None:
+            max_return = max_asset_return
+        else:
+            max_return = np.dot(max_return_weights, self.sample_mean_returns)
         
-        # Create array of target returns
-        self.target_returns = np.linspace(min_return, max_return, self.num_portfolios)
+        if np.isclose(max_return, min_return):
+            max_return = min_return + 1e-4
+        
+        # Create array of target returns within the feasible band
+        raw_target_returns = np.linspace(min_return, max_return, self.num_portfolios)
+        
+        # Compute the sample efficient frontier to anchor Michaud's resampling grid
+        base_weights, base_returns, base_risks = self.compute_efficient_frontier_for_sample(
+            self.sample_mean_returns,
+            self.sample_cov_matrix,
+            raw_target_returns
+        )
+        self.base_frontier_weights = np.array(base_weights)
+        self.base_frontier_returns = np.array(base_returns)
+        self.base_frontier_risks = np.array(base_risks)
+        self.target_returns = self.base_frontier_returns.copy()
         
         # Initialize storage for all simulation results
         all_weights = []
@@ -404,6 +462,9 @@ class MichaudOptimization:
         traditional_weights : numpy array
             Weights along traditional efficient frontier
         """
+        if self.target_returns is None:
+            raise ValueError("Must run run_resampled_optimization() before calling this method.")
+        
         traditional_weights = []
         traditional_returns = []
         traditional_risks = []
@@ -523,9 +584,11 @@ class MichaudOptimization:
         print(f"\n{'='*60}")
         print(f"Portfolio Characteristics:")
         print(f"{'='*60}")
+        excess_return = portfolio_return - self.risk_free_rate
+        sharpe = excess_return / portfolio_risk if portfolio_risk > 0 else np.nan
         print(f"Expected Return: {portfolio_return*100:.4f}%")
         print(f"Risk (Std Dev):  {portfolio_risk*100:.4f}%")
-        print(f"Sharpe Ratio:    {portfolio_return/portfolio_risk:.4f}")
+        print(f"Sharpe Ratio (excess over rf): {sharpe:.4f}")
         print(f"\nAsset Allocation:")
         print(weights_df.to_string(index=False))
         print(f"{'='*60}\n")
@@ -550,8 +613,14 @@ class MichaudOptimization:
         # Find maximum return portfolio
         max_return_idx = np.argmax(self.resampled_returns)
         
-        # Find maximum Sharpe ratio portfolio (assuming risk-free rate = 0)
-        sharpe_ratios = self.resampled_returns / self.resampled_risks
+        # Find maximum Sharpe ratio portfolio using specified risk-free rate
+        excess_returns = self.resampled_returns - self.risk_free_rate
+        sharpe_ratios = np.divide(
+            excess_returns,
+            self.resampled_risks,
+            out=np.full_like(excess_returns, np.nan),
+            where=self.resampled_risks > 0
+        )
         max_sharpe_idx = np.argmax(sharpe_ratios)
         
         summary_data = {
@@ -626,6 +695,10 @@ class MichaudOptimization:
         trad_weights_opt = self.optimize_portfolio_for_target_return(
             target_return, self.sample_mean_returns, self.sample_cov_matrix
         )
+        if trad_weights_opt is None:
+            raise ValueError(
+                "Target return is infeasible for the traditional frontier under current constraints."
+            )
         
         # Create comparison DataFrame
         comparison_df = pd.DataFrame({
@@ -700,8 +773,10 @@ if __name__ == "__main__":
     
     michaud = MichaudOptimization(
         returns_data=returns_df,
-        num_simulations=500,   # Number of Bayesian Monte Carlo simulations
-        num_portfolios=100      # Number of portfolios along the frontier
+        num_simulations=500,    # Number of Bayesian Monte Carlo simulations
+        num_portfolios=100,     # Number of portfolios along the frontier
+        risk_free_rate=0.00005, # Example risk-free rate (~1.25% annualized)
+        random_state=42
     )
     
     # Run the resampled optimization
