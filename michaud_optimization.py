@@ -4,7 +4,47 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from scipy.stats import multivariate_normal, wishart, invwishart
 import warnings
+import yfinance as yf
 warnings.filterwarnings('ignore')
+
+
+def fetch_log_returns(tickers, start_date, end_date, price_field="Adj Close"):
+    """
+    Download historical prices via yfinance and convert to daily log returns.
+    """
+    tickers = [ticker.upper() for ticker in tickers]
+    price_data = yf.download(
+        tickers,
+        start=start_date,
+        end=end_date,
+        interval="1d",
+        auto_adjust=True,
+        progress=False
+    )
+    
+    if price_data.empty:
+        raise ValueError("No price data returned from yfinance. Check tickers or date range.")
+    
+    if isinstance(price_data.columns, pd.MultiIndex):
+        if price_field in price_data.columns.get_level_values(0):
+            prices = price_data[price_field]
+        else:
+            prices = price_data.xs("Close", level=0, axis=1)
+    else:
+        prices = price_data
+    
+    prices = prices.ffill().dropna(how="all")
+    log_returns = np.log(prices / prices.shift(1)).dropna()
+    log_returns = log_returns.dropna(axis=1, how="all")
+    log_returns.columns = [str(col).upper() for col in log_returns.columns]
+    
+    missing_cols = [ticker for ticker in tickers if ticker not in log_returns.columns]
+    if missing_cols:
+        raise ValueError(f"Missing return columns for tickers: {missing_cols}")
+    
+    log_returns = log_returns.loc[:, tickers]
+    log_returns.index.name = "Date"
+    return log_returns
 
 
 class MichaudOptimization:
@@ -728,47 +768,48 @@ class MichaudOptimization:
 
 # Example usage
 if __name__ == "__main__":
-    # Generate sample data (replace this with your actual stock returns data)
-    np.random.seed(42)
-    dates = pd.date_range(start='2020-01-01', end='2023-12-31', freq='D')
+    """
+    Example script using live market data for Google, Apple, Amazon, eBay, NVIDIA, and AMD.
+    Falls back to simulated data if downloading fails (e.g., offline environment).
+    """
+    preferred_tickers = ["GOOGL", "AAPL", "AMZN", "EBAY", "NVDA", "AMD", "VOO"]
+    start_date = "2018-01-01"
+    end_date = "2025-11-26"
     
-    # Simulate returns for 5 stocks
-    num_stocks = 5
-    num_days = len(dates)
+    try:
+        returns_df = fetch_log_returns(preferred_tickers, start_date, end_date)
+        print("="*60)
+        print("YFINANCE DAILY LOG RETURNS (auto-adjusted)")
+        print("="*60)
+        print(returns_df.head(10))
+        print(f"\nData shape: {returns_df.shape}")
+        print(f"Date range: {returns_df.index[0]} to {returns_df.index[-1]}")
+        data_source = "yfinance"
+    except Exception as exc:
+        print("="*60)
+        print("WARNING: Failed to download live prices. Falling back to simulated data.")
+        print(f"Reason: {exc}")
+        print("="*60)
+        np.random.seed(42)
+        dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        num_days = len(dates)
+        mean_returns = np.array([0.0005, 0.0007, 0.0004, 0.0006, 0.0003, 0.00055])
+        correlation = np.array([
+            [1.0, 0.6, 0.3, 0.4, 0.2, 0.5],
+            [0.6, 1.0, 0.5, 0.3, 0.4, 0.45],
+            [0.3, 0.5, 1.0, 0.6, 0.3, 0.35],
+            [0.4, 0.3, 0.6, 1.0, 0.5, 0.25],
+            [0.2, 0.4, 0.3, 0.5, 1.0, 0.4],
+            [0.5, 0.45, 0.35, 0.25, 0.4, 1.0]
+        ])
+        volatilities = np.array([0.02, 0.025, 0.018, 0.022, 0.03, 0.028])
+        cov_matrix = np.outer(volatilities, volatilities) * correlation
+        returns = np.random.multivariate_normal(mean_returns, cov_matrix, num_days)
+        returns_df = pd.DataFrame(returns, index=dates, columns=preferred_tickers)
+        data_source = "simulated"
     
-    # Create realistic mean returns
-    mean_returns = np.array([0.0005, 0.0007, 0.0004, 0.0006, 0.0003])
-    
-    # Create a realistic correlation matrix
-    correlation = np.array([
-        [1.0, 0.6, 0.3, 0.4, 0.2],
-        [0.6, 1.0, 0.5, 0.3, 0.4],
-        [0.3, 0.5, 1.0, 0.6, 0.3],
-        [0.4, 0.3, 0.6, 1.0, 0.5],
-        [0.2, 0.4, 0.3, 0.5, 1.0]
-    ])
-    
-    volatilities = np.array([0.02, 0.025, 0.018, 0.022, 0.015])
-    cov_matrix = np.outer(volatilities, volatilities) * correlation
-    
-    # Generate sample returns
-    returns = np.random.multivariate_normal(mean_returns, cov_matrix, num_days)
-    returns_df = pd.DataFrame(
-        returns,
-        index=dates,
-        columns=['Stock_A', 'Stock_B', 'Stock_C', 'Stock_D', 'Stock_E']
-    )
-    
-    print("="*60)
-    print("SAMPLE STOCK RETURNS DATA")
-    print("="*60)
-    print(returns_df.head(10))
-    print(f"\nData shape: {returns_df.shape}")
-    print(f"Date range: {returns_df.index[0]} to {returns_df.index[-1]}")
-    
-    # Create and run Michaud Optimization
     print("\n" + "="*60)
-    print("INITIALIZING MICHAUD OPTIMIZATION MODEL")
+    print(f"INITIALIZING MICHAUD OPTIMIZATION MODEL ({data_source.upper()} DATA)")
     print("="*60)
     
     michaud = MichaudOptimization(
@@ -779,16 +820,10 @@ if __name__ == "__main__":
         random_state=42
     )
     
-    # Run the resampled optimization
     michaud.run_resampled_optimization()
-    
-    # Get summary statistics
     michaud.get_summary_statistics()
-    
-    # Plot the efficient frontiers
     michaud.plot_efficient_frontiers(show_traditional=True)
     
-    # Get specific portfolio weights
     print("\n" + "="*60)
     print("EXAMPLE PORTFOLIO 1: Target Return of 0.05%")
     michaud.get_portfolio_weights(target_return=0.0005)
@@ -798,5 +833,4 @@ if __name__ == "__main__":
     min_risk = np.min(michaud.resampled_risks)
     michaud.get_portfolio_weights(target_risk=min_risk)
     
-    # Compare stability
     michaud.compare_portfolio_stability(target_return=0.0005)
