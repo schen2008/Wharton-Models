@@ -7,7 +7,6 @@ import warnings
 import yfinance as yf
 warnings.filterwarnings('ignore')
 
-
 def fetch_log_returns(tickers, start_date, end_date, price_field="Adj Close"):
     """
     Download historical prices via yfinance and convert to daily log returns.
@@ -83,7 +82,9 @@ class MichaudOptimization:
         self.num_assets = returns_data.shape[1]
         self.num_observations = len(returns_data)
         self.asset_names = returns_data.columns.tolist()
-        self.risk_free_rate = risk_free_rate
+        # Convert annual rf → daily rf for daily returns
+        self.rf_daily = (1 + risk_free_rate)**(1/252) - 1
+        self.risk_free_rate = risk_free_rate  # Keep original for backward compatibility if needed
         self.rng = np.random.default_rng(random_state)
         
         # Calculate sample statistics from historical data
@@ -618,18 +619,32 @@ class MichaudOptimization:
             'Weight %': weights * 100
         })
         
-        # Filter out near-zero weights for cleaner display
-        weights_df = weights_df[weights_df['Weight'] > 0.001].sort_values('Weight', ascending=False)
+        # Sort by weight descending for display
+        weights_df = weights_df.sort_values('Weight', ascending=False)
         
         print(f"\n{'='*60}")
         print(f"Portfolio Characteristics:")
         print(f"{'='*60}")
-        excess_return = portfolio_return - self.risk_free_rate
-        sharpe = excess_return / portfolio_risk if portfolio_risk > 0 else np.nan
-        print(f"Expected Return: {portfolio_return*100:.4f}%")
-        print(f"Risk (Std Dev):  {portfolio_risk*100:.4f}%")
-        print(f"Sharpe Ratio (excess over rf): {sharpe:.4f}")
-        print(f"\nAsset Allocation:")
+        # 1) Convert mean log return → simple return
+        # For log-normal returns: E[R] = exp(E[log(R)] + 0.5*Var[log(R)])
+        # portfolio_return = E[log(R)], portfolio_risk² = Var[log(R)]
+        simple_return = np.exp(portfolio_return + 0.5 * portfolio_risk**2) - 1
+        
+        # 2) Use daily rf
+        excess_return = simple_return - self.rf_daily
+        
+        # 3) Compute daily Sharpe
+        daily_sharpe = excess_return / portfolio_risk if portfolio_risk > 0 else np.nan
+        
+        # 4) Annualize Sharpe for reporting
+        annual_sharpe = daily_sharpe * np.sqrt(252)
+        annual_return = simple_return * 252
+        annual_risk = portfolio_risk * np.sqrt(252)
+        
+        print(f"Expected Return (annualized): {annual_return*100:.4f}%")
+        print(f"Risk (annualized std dev): {annual_risk*100:.4f}%")
+        print(f"Sharpe Ratio (annualized): {annual_sharpe:.4f}")
+        print(f"\nAsset Allocation (all assets):")
         print(weights_df.to_string(index=False))
         print(f"{'='*60}\n")
         
@@ -654,13 +669,21 @@ class MichaudOptimization:
         max_return_idx = np.argmax(self.resampled_returns)
         
         # Find maximum Sharpe ratio portfolio using specified risk-free rate
-        excess_returns = self.resampled_returns - self.risk_free_rate
-        sharpe_ratios = np.divide(
-            excess_returns,
-            self.resampled_risks,
-            out=np.full_like(excess_returns, np.nan),
-            where=self.resampled_risks > 0
-        )
+        # Convert log → simple return
+        # For log-normal returns: E[R] = exp(E[log(R)] + 0.5*Var[log(R)])
+        simple_returns = np.exp(self.resampled_returns + 0.5 * self.resampled_risks**2) - 1
+        
+        # Compute daily Sharpe
+        daily_sharpes = (simple_returns - self.rf_daily) / self.resampled_risks
+        daily_sharpes = np.where(self.resampled_risks > 0, daily_sharpes, np.nan)
+        
+        # Annualize Sharpe
+        sharpe_ratios = daily_sharpes * np.sqrt(252)
+        
+        # Annualize return/risk
+        annual_returns = simple_returns * 252
+        annual_risks = self.resampled_risks * np.sqrt(252)
+        
         max_sharpe_idx = np.argmax(sharpe_ratios)
         
         summary_data = {
@@ -682,16 +705,16 @@ class MichaudOptimization:
                 'Number of Assets'
             ],
             'Value': [
-                f"{self.resampled_returns[min_risk_idx]*100:.4f}%",
-                f"{self.resampled_risks[min_risk_idx]*100:.4f}%",
+                f"{annual_returns[min_risk_idx]*100:.4f}%",
+                f"{annual_risks[min_risk_idx]*100:.4f}%",
                 f"{sharpe_ratios[min_risk_idx]:.4f}",
                 '',
-                f"{self.resampled_returns[max_return_idx]*100:.4f}%",
-                f"{self.resampled_risks[max_return_idx]*100:.4f}%",
+                f"{annual_returns[max_return_idx]*100:.4f}%",
+                f"{annual_risks[max_return_idx]*100:.4f}%",
                 f"{sharpe_ratios[max_return_idx]:.4f}",
                 '',
-                f"{self.resampled_returns[max_sharpe_idx]*100:.4f}%",
-                f"{self.resampled_risks[max_sharpe_idx]*100:.4f}%",
+                f"{annual_returns[max_sharpe_idx]*100:.4f}%",
+                f"{annual_risks[max_sharpe_idx]*100:.4f}%",
                 f"{sharpe_ratios[max_sharpe_idx]:.4f}",
                 '',
                 self.num_portfolios,
@@ -772,7 +795,7 @@ if __name__ == "__main__":
     Example script using live market data for Google, Apple, Amazon, eBay, NVIDIA, and AMD.
     Falls back to simulated data if downloading fails (e.g., offline environment).
     """
-    preferred_tickers = ["GOOGL", "AAPL", "AMZN", "EBAY", "NVDA", "AMD", "VOO"]
+    preferred_tickers = ["CENX","BZ","CART","CALM","ARLP","ERIE","FAST","GLPI","ERIC","CHKP"] 
     start_date = "2018-01-01"
     end_date = "2025-11-26"
     
@@ -824,13 +847,26 @@ if __name__ == "__main__":
     michaud.get_summary_statistics()
     michaud.plot_efficient_frontiers(show_traditional=True)
     
-    print("\n" + "="*60)
-    print("EXAMPLE PORTFOLIO 1: Target Return of 0.05%")
-    michaud.get_portfolio_weights(target_return=0.0005)
+    # Find maximum Sharpe portfolio automatically
+    simple_returns = np.exp(michaud.resampled_returns + 0.5 * michaud.resampled_risks**2) - 1
+    daily_sharpes = (simple_returns - michaud.rf_daily) / michaud.resampled_risks
+    daily_sharpes = np.where(michaud.resampled_risks > 0, daily_sharpes, np.nan)
+    sharpe_ratios = daily_sharpes * np.sqrt(252)
+    max_sharpe_idx = np.argmax(sharpe_ratios)
+    max_sharpe_return = michaud.resampled_returns[max_sharpe_idx]
     
     print("\n" + "="*60)
-    print("EXAMPLE PORTFOLIO 2: Minimum Risk Portfolio")
+    print("OPTIMIZED PORTFOLIO: Maximum Sharpe Ratio Portfolio")
+    print("="*60)
+    michaud.get_portfolio_weights(target_return=max_sharpe_return)
+    
+    print("\n" + "="*60)
+    print("MINIMUM RISK PORTFOLIO")
+    print("="*60)
     min_risk = np.min(michaud.resampled_risks)
     michaud.get_portfolio_weights(target_risk=min_risk)
     
-    michaud.compare_portfolio_stability(target_return=0.0005)
+    # Use median return for comparison if available
+    median_return = np.median(michaud.resampled_returns)
+    if not np.isnan(median_return):
+        michaud.compare_portfolio_stability(target_return=median_return)
