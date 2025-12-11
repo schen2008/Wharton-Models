@@ -1,85 +1,142 @@
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
+import re
 
-# -----------------------------------------------------
-#  EDIT THIS ARRAY ONLY
-# -----------------------------------------------------
 TICKERS = [
-    "ARGX",
-    "ARLP",
-    "BZ",
-    "CALM",
-    "CART",
-    "COCO",
-    "ERIC",
-    "GBDC",
-    "GLPI",
-    "GTX",
-    "INVA",
-    "KRYS",
-    "IEF",
-    "TIP",
-    "TLT",
+    "ARGX","ARLP","BZ","CALM","CART","COCO",
+    "ERIC","GBDC","GLPI","GTX","INVA","KRYS",
+    "IEF","TIP","TLT"
 ]
-# -----------------------------------------------------
 
+ETF_TICKERS = {"IEF","TIP","TLT"}
+BDC_TICKERS = {"GBDC"}
 
-def fetch_yahoo(ticker):
-    """Fetch EV and EBITDA from Yahoo Finance. Works for ETFs too."""
+# -----------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------
+
+def extract_num(text):
+    if not text:
+        return None
+    text = text.replace(",", "").replace("$", "").strip()
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+        return float(text)
+    except:
+        m = re.search(r"\d+\.?\d*", text)
+        return float(m.group()) if m else None
 
-        # Check if we got valid data
-        ev = info.get("enterpriseValue", None)
-        ebitda = info.get("ebitda", None)
 
-        if ev is None or ebitda is None:
-            print(f"Warning: EV or EBITDA missing for {ticker}")
-        return ev, ebitda
-    except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
-        return None, None
+# -----------------------------------------------------------
+# Google Finance Scraper (WORKS for ERIC)
+# Example: https://www.google.com/finance/quote/ERIC:NASDAQ
+# -----------------------------------------------------------
 
-def ev_ebitda(ev, ebitda):
-    """Safe EV/EBITDA calculation."""
-    if ev is None or ebitda is None:
+def google_finance_ev_ebitda(ticker):
+    try:
+        url = f"https://www.google.com/finance/quote/{ticker}:NASDAQ"
+        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+
+        rows = soup.find_all("div", class_="gyFHrc")
+
+        ev = None
+        ebitda = None
+        ratio = None
+
+        for row in rows:
+            label = row.find("div", class_="mfs7Fc")
+            value = row.find("div", class_="P6K39c")
+            if not label or not value:
+                continue
+
+            label = label.text.strip().lower()
+            value = value.text.strip()
+
+            if label == "enterprise value":
+                ev = extract_num(value)
+
+            if label == "ebitda":
+                ebitda = extract_num(value)
+
+            if label in ("ev/ebitda","ev to ebitda","ev to ebitda ttm"):
+                ratio = extract_num(value)
+
+        if ratio:
+            return ratio, "Google Finance (direct ratio)"
+
+        if ev and ebitda:
+            return ev / ebitda, "Google Finance"
+
         return None
-    if ebitda == 0:
+    except:
         return None
-    return ev / ebitda
 
 
-def calculate_ev_ebitda(tickers):
+# -----------------------------------------------------------
+# Yahoo attempt
+# -----------------------------------------------------------
+
+def yahoo_ev_ebitda(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        ev = info.get("enterpriseValue")
+        ebitda = info.get("ebitda")
+        if ev and ebitda:
+            return ev / ebitda, "Yahoo"
+        return None
+    except:
+        return None
+
+
+# -----------------------------------------------------------
+# Main fetcher
+# -----------------------------------------------------------
+
+def fetch_ratio(ticker):
+    t = ticker.upper()
+
+    # ETFs never have EBITDA
+    if t in ETF_TICKERS:
+        return None, "N/A (ETF, no EBITDA exists)"
+
+    # BDCs often report no EBITDA
+    if t in BDC_TICKERS:
+        return None, "N/A (BDC, EBITDA not reported)"
+
+    # 1. Yahoo
+    r = yahoo_ev_ebitda(t)
+    if r:
+        return r
+
+    # 2. Google Finance (works for ERIC)
+    r = google_finance_ev_ebitda(t)
+    if r:
+        return r
+
+    # Fallback
+    return None, "Missing from all accessible sources"
+
+
+# -----------------------------------------------------------
+# Run
+# -----------------------------------------------------------
+
+if __name__ == "__main__":
     results = {}
     missing = {}
 
-    for t in tickers:
-        t_upper = t.upper()
-
-        ev, ebitda = fetch_yahoo(t_upper)
-
-        if ev is None or ebitda is None:
-            missing[t_upper] = "Missing EV or EBITDA from Yahoo Finance."
-            continue
-
-        ratio = ev_ebitda(ev, ebitda)
-
-        if ratio is None:
-            missing[t_upper] = "Invalid EV or EBITDA values."
-            continue
-
-        results[t_upper] = float(f"{ratio:.6f}")
-
-    return {"results": results, "missing": missing}
-
-
-if __name__ == "__main__":
-    output = calculate_ev_ebitda(TICKERS)
+    for t in TICKERS:
+        ratio, src = fetch_ratio(t)
+        if ratio:
+            results[t] = (round(ratio, 4), src)
+        else:
+            missing[t] = src
 
     print("\n========= EV/EBITDA RESULTS =========")
-    for t, value in output["results"].items():
-        print(f"{t}: {value}")
+    for t, (val, src) in results.items():
+        print(f"{t}: {val}  (source: {src})")
 
-    print("\n========= MISSING DATA =========")
-    for t, msg in output["missing"].items():
+    print("\n========= MISSING OR N/A =========")
+    for t, msg in missing.items():
         print(f"{t}: {msg}")
