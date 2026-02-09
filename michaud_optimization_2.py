@@ -27,9 +27,7 @@ def fetch_log_returns(tickers, start_date, end_date, price_field="Adj Close"):
     if price_data.empty:
         raise ValueError("No price data returned from yfinance. Check tickers or date range.")
 
-    # yfinance returns a MultiIndex for columns when multiple tickers; handle both cases
     if isinstance(price_data.columns, pd.MultiIndex):
-        # Prefer 'Adj Close' level if present
         if price_field in price_data.columns.get_level_values(0):
             prices = price_data[price_field]
         else:
@@ -74,17 +72,15 @@ class MichaudOptimization:
         self.num_observations = len(returns_data)
         self.asset_names = returns_data.columns.tolist()
 
-        # annual risk-free (input) and daily rf computed from it
         self.risk_free_rate = float(risk_free_rate)
         self.rf_daily = (1 + self.risk_free_rate) ** (1 / 252) - 1.0
 
         self.rng = np.random.default_rng(random_state)
 
-        # sample statistics
-        self.sample_mean_returns = returns_data.mean().values  # daily log-return means
-        self.sample_cov_matrix = returns_data.cov().values     # daily covariance
+        self.sample_mean_returns = returns_data.mean().values  
+        self.sample_cov_matrix = returns_data.cov().values     
 
-        # storage for results
+
         self.base_frontier_weights = None
         self.base_frontier_returns = None
         self.base_frontier_risks = None
@@ -96,9 +92,6 @@ class MichaudOptimization:
         print(f"Number of observations: {self.num_observations}")
         print(f"Number of assets: {self.num_assets}")
 
-    # ---------------------------
-    # Utilities
-    # ---------------------------
     def _normalize_weights(self, weights):
         weights = np.clip(weights, 0.0, None)
         total = np.sum(weights)
@@ -106,9 +99,6 @@ class MichaudOptimization:
             return None
         return weights / total
 
-    # ---------------------------
-    # Bayesian resampling
-    # ---------------------------
     def generate_bayesian_monte_carlo_sample(self):
         """
         Sample (mu, Sigma) using inverse-Wishart for Sigma and multivariate normal for mu | Sigma.
@@ -117,34 +107,27 @@ class MichaudOptimization:
         T = self.num_observations
         n = self.num_assets
 
-        df = max(T - 1, n + 1)  # degrees of freedom; ensure >= n for stability
+        df = max(T - 1, n + 1) 
         scale = (T - 1) * self.sample_cov_matrix
 
-        # try sampling inverse-Wishart (scipy's invwishart.rvs)
         try:
             simulated_cov = invwishart.rvs(df=df, scale=scale, random_state=self.rng)
         except Exception:
-            # fallback: sample Wishart of precision and invert
             precision_sample = wishart.rvs(df=df, scale=np.linalg.pinv(scale), random_state=self.rng)
             simulated_cov = np.linalg.inv(precision_sample)
 
         simulated_cov = (simulated_cov + simulated_cov.T) / 2.0
 
-        # regularize if the smallest eigenvalue is non-positive or tiny
         eigvals = np.linalg.eigvalsh(simulated_cov)
         min_eig = np.min(eigvals)
         if min_eig <= 1e-10:
             simulated_cov += np.eye(n) * (1e-8 - min_eig)
 
-        # conditional mean covariance (sampling distribution for the mean)
         mean_cov = simulated_cov / T
         simulated_mean = multivariate_normal.rvs(mean=self.sample_mean_returns, cov=mean_cov, random_state=self.rng)
 
         return simulated_mean, simulated_cov
 
-    # ---------------------------
-    # Portfolio functions
-    # ---------------------------
     def portfolio_performance(self, weights, mean_returns, cov_matrix):
         """
         weights: 1D array
@@ -190,7 +173,6 @@ class MichaudOptimization:
         except Exception:
             pass
 
-        # Relax to inequality (allow >= target_return)
         cons_relaxed = [
             {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
             {'type': 'ineq', 'fun': lambda w: np.dot(w, mean_returns) - target_return}
@@ -227,9 +209,7 @@ class MichaudOptimization:
                 return w
         return np.ones(n) / n
 
-    # ---------------------------
-    # Efficient frontier for a sample (MVO)
-    # ---------------------------
+
     def compute_efficient_frontier_for_sample(self, mean_returns, cov_matrix, target_returns):
         frontier_weights = []
         frontier_returns = []
@@ -248,9 +228,6 @@ class MichaudOptimization:
 
         return frontier_weights, frontier_returns, frontier_risks
 
-    # ---------------------------
-    # Main resampled optimization loop
-    # ---------------------------
     def run_resampled_optimization(self, verbose=True):
         """
         Execute the Michaud resampled efficiency algorithm.
@@ -261,11 +238,8 @@ class MichaudOptimization:
             print(f"Simulations: {self.num_simulations}, Portfolios per frontier: {self.num_portfolios}")
             print("-" * 60)
 
-        # Establish feasible target-return band from sample estimates
         min_var_w = self.optimize_minimum_variance_portfolio(self.sample_mean_returns, self.sample_cov_matrix)
         min_return = float(np.dot(min_var_w, self.sample_mean_returns))
-
-        # try find maximum achievable return by using max single asset or optimization
         max_asset_return = float(np.max(self.sample_mean_returns))
         max_return_w = self.optimize_portfolio_for_target_return(max_asset_return, self.sample_mean_returns, self.sample_cov_matrix)
         if max_return_w is None:
@@ -276,17 +250,14 @@ class MichaudOptimization:
         if np.isclose(max_return, min_return):
             max_return = min_return + 1e-6
 
-        # target return grid (daily log-mean returns)
         target_returns = np.linspace(min_return, max_return, self.num_portfolios)
 
-        # compute base frontier using sample estimates (anchor)
         base_w, base_r, base_risk = self.compute_efficient_frontier_for_sample(self.sample_mean_returns, self.sample_cov_matrix, target_returns)
         self.base_frontier_weights = np.array(base_w)
         self.base_frontier_returns = np.array(base_r)
         self.base_frontier_risks = np.array(base_risk)
         self.target_returns = self.base_frontier_returns.copy()
 
-        # storage for all simulations
         all_weights = []
         successful = 0
 
@@ -300,7 +271,6 @@ class MichaudOptimization:
                 all_weights.append(w_sim)
                 successful += 1
             except Exception as e:
-                # skip simulation if numerical issues occur
                 if verbose and sim < 10:
                     print(f"Warning: simulation {sim+1} failed: {str(e)[:200]}")
                 continue
@@ -311,20 +281,15 @@ class MichaudOptimization:
         if successful == 0:
             raise RuntimeError("All simulations failed. Check input data or reduce num_simulations.")
 
-        # convert to array: shape (successful, num_portfolios, num_assets)
         all_weights_array = np.array(all_weights, dtype=float)
 
-        # average weights across simulations (Michaud)
-        # shape -> (num_portfolios, num_assets)
         self.resampled_weights = np.mean(all_weights_array, axis=0)
 
-        # normalize rows
         for i in range(self.resampled_weights.shape[0]):
             s = np.sum(self.resampled_weights[i])
             if s > 0:
                 self.resampled_weights[i] /= s
 
-        # evaluate using sample estimates (daily)
         self.resampled_returns = np.zeros(self.num_portfolios, dtype=float)
         self.resampled_risks = np.zeros(self.num_portfolios, dtype=float)
         for i in range(self.num_portfolios):
@@ -336,9 +301,6 @@ class MichaudOptimization:
             print("Resampled optimization complete!")
             print("=" * 60)
 
-    # ---------------------------
-    # Traditional frontier for comparison
-    # ---------------------------
     def compute_traditional_efficient_frontier(self):
         if getattr(self, "target_returns", None) is None:
             raise ValueError("Must run run_resampled_optimization() before calling this method.")
@@ -353,10 +315,7 @@ class MichaudOptimization:
                 trad_r.append(r)
                 trad_risk.append(risk)
         return np.array(trad_r), np.array(trad_risk), np.array(trad_w)
-
-    # ---------------------------
-    # Compute levered tangent portfolio (along the CML)
-    # ---------------------------
+    
     def compute_levered_tangent_portfolio(self, target_annual_risk):
         """
         Compute levered portfolio along the CML to reach a target annual risk (decimal, e.g. 0.15 = 15%).
@@ -365,7 +324,6 @@ class MichaudOptimization:
         if self.resampled_returns is None:
             raise ValueError("Must run run_resampled_optimization() first!")
 
-        # determine tangent (max Sharpe) index from resampled frontier
         simple_returns = np.exp(self.resampled_returns + 0.5 * (self.resampled_risks ** 2)) - 1.0
         annual_returns = simple_returns * 252.0
         annual_risks = self.resampled_risks * np.sqrt(252.0)
@@ -378,7 +336,6 @@ class MichaudOptimization:
         tangent_annual_risk = annual_risks[tangent_idx]
         tangent_annual_return = annual_returns[tangent_idx]
 
-        # scaling factor to reach target annual risk
         if tangent_annual_risk <= 0:
             raise ValueError("Tangent portfolio has non-positive risk; cannot lever.")
         scale = float(target_annual_risk) / float(tangent_annual_risk)
@@ -386,12 +343,10 @@ class MichaudOptimization:
         levered_weights = tangent_w * scale
         weight_rf = 1.0 - np.sum(levered_weights)
 
-        # compute resulting annual return and sharpe
         levered_annual_return = weight_rf * annual_rf + scale * tangent_annual_return
         levered_annual_risk = abs(scale) * tangent_annual_risk
         levered_sharpe = (levered_annual_return - annual_rf) / levered_annual_risk if levered_annual_risk > 0 else np.nan
 
-        # assemble weights with CASH/RISK_FREE
         weights_df = pd.DataFrame({
             'Asset': self.asset_names + ['CASH_RISK_FREE'],
             'Weight': np.concatenate([levered_weights, np.array([weight_rf])]),
@@ -407,24 +362,19 @@ class MichaudOptimization:
             'tangent_idx': tangent_idx
         }
 
-    # ---------------------------
-    # Plot frontier(s) + CML + moderate band
-    # ---------------------------
     def plot_efficient_frontiers(self, show_traditional=True, show_cml=True, moderate_risk_band=(0.09, 0.12), figsize=(14, 9)):
         if self.resampled_returns is None:
             raise ValueError("Must run run_resampled_optimization() first!")
 
         plt.figure(figsize=figsize)
 
-        # resampled frontier (annualized)
-        annual_res_risk = self.resampled_risks * np.sqrt(252)  # decimals
+        annual_res_risk = self.resampled_risks * np.sqrt(252)  
         simple_returns = np.exp(self.resampled_returns + 0.5 * self.resampled_risks ** 2) - 1
         annual_res_return = simple_returns * 252
 
         plt.plot(annual_res_risk * 100, annual_res_return * 100, 'b-', linewidth=3, label='Resampled Efficient Frontier (Michaud)', zorder=3)
         plt.scatter(annual_res_risk * 100, annual_res_return * 100, c='blue', s=25, alpha=0.6, zorder=3)
-
-        # traditional
+        
         if show_traditional:
             trad_r, trad_risk, _ = self.compute_traditional_efficient_frontier()
             if len(trad_r) > 0:
@@ -434,7 +384,6 @@ class MichaudOptimization:
                 plt.plot(trad_annual_risk * 100, trad_annual_ret * 100, 'r--', linewidth=2.2, label='Traditional MVO Frontier', alpha=0.8, zorder=2)
                 plt.scatter(trad_annual_risk * 100, trad_annual_ret * 100, c='red', s=20, alpha=0.4, zorder=2)
 
-        # assets
         asset_annual_ret = self.sample_mean_returns * 252
         asset_annual_risk = np.sqrt(np.diag(self.sample_cov_matrix)) * np.sqrt(252)
         plt.scatter(asset_annual_risk * 100, asset_annual_ret * 100, c='green', s=120, alpha=0.8, marker='D', label='Assets', zorder=4)
@@ -442,15 +391,12 @@ class MichaudOptimization:
             plt.annotate(name, (asset_annual_risk[i] * 100, asset_annual_ret[i] * 100), xytext=(6, 6), textcoords='offset points',
                          fontsize=9, bbox=dict(boxstyle='round,pad=0.2', facecolor='yellow', alpha=0.25))
 
-        # moderate-risk band (annualized, percents)
         min_band, max_band = moderate_risk_band
         plt.axvspan(min_band * 100, max_band * 100, color='orange', alpha=0.12, label=f"Moderate risk band ({min_band*100:.0f}%–{max_band*100:.0f}%)")
 
-        # CML (use resampled max-Sharpe as tangent)
         cml_point = None
         if show_cml:
             annual_rf = self.risk_free_rate
-            # compute annual sharpe for resampled frontier
             with np.errstate(divide='ignore', invalid='ignore'):
                 sharpe_array = (annual_res_return - annual_rf) / annual_res_risk
             valid = np.isfinite(sharpe_array)
@@ -466,14 +412,12 @@ class MichaudOptimization:
                 plt.scatter(risk_t * 100, ret_t * 100, marker='X', s=110, c='black', zorder=6, label='Tangent (max Sharpe)')
                 cml_point = {'tangent_idx': tangent_idx, 'risk': risk_t, 'return': ret_t, 'slope': slope}
 
-        # Mark best Sharpe within moderate-risk band and print its portfolio
         best_mod = self.get_best_sharpe_within_risk_band(min_annual_risk=min_band, max_annual_risk=max_band)
         if best_mod is not None:
-            # best_mod contains annual_return, annual_risk
+
             plt.scatter(best_mod['annual_risk'] * 100, best_mod['annual_return'] * 100, marker='*', s=250, c='magenta', zorder=7, label=f"Best Sharpe in {min_band*100:.0f}%–{max_band*100:.0f}% band")
             plt.annotate('Best (9%–12%)', (best_mod['annual_risk'] * 100, best_mod['annual_return'] * 100), xytext=(8, -18), textcoords='offset points', fontsize=10, fontweight='bold', bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
         else:
-            # If no long-only portfolio in the band, compute levered CML portfolio at midpoint of band and print it
             if cml_point is not None:
                 mid_band = 0.5 * (min_band + max_band)
                 levered = self.compute_levered_tangent_portfolio(mid_band)
@@ -495,9 +439,6 @@ class MichaudOptimization:
         plt.tight_layout()
         plt.show()
 
-    # ---------------------------
-    # Get weights and summary for a selected portfolio
-    # ---------------------------
     def get_portfolio_weights(self, target_risk=None, target_return=None, annualized=False):
         """
         Returns (weights_df, summary) for the portfolio nearest to target_risk OR target_return.
@@ -508,15 +449,11 @@ class MichaudOptimization:
             raise ValueError("Must run run_resampled_optimization() first!")
 
         if target_risk is not None and annualized:
-            # convert annual decimal -> daily
             target_risk_daily = float(target_risk) / np.sqrt(252)
             idx = int(np.argmin(np.abs(self.resampled_risks - target_risk_daily)))
         elif target_risk is not None:
             idx = int(np.argmin(np.abs(self.resampled_risks - float(target_risk))))
         elif target_return is not None and annualized:
-            # convert annual simple return -> approximate daily log-mean
-            # approximate: daily_log_mean ≈ ln(1+annual_simple_return)/252 - 0.5*var_daily
-            # but user likely passes daily log-mean; we keep simple: convert annual simple to daily log ≈ ln(1+R_ann)/252
             daily_log = np.log(1.0 + float(target_return)) / 252.0
             idx = int(np.argmin(np.abs(self.resampled_returns - daily_log)))
         elif target_return is not None:
@@ -534,8 +471,7 @@ class MichaudOptimization:
             'Weight %': weights * 100.0
         }).sort_values('Weight', ascending=False).reset_index(drop=True)
 
-        # compute simple returns / sharpe in human-friendly annualized terms
-        simple_ret = np.exp(port_ret + 0.5 * (port_risk ** 2)) - 1.0  # daily simple mean
+        simple_ret = np.exp(port_ret + 0.5 * (port_risk ** 2)) - 1.0  
         annual_return = simple_ret * 252.0
         annual_risk = port_risk * np.sqrt(252.0)
         annual_excess = annual_return - self.risk_free_rate
@@ -548,7 +484,6 @@ class MichaudOptimization:
             'Annual Sharpe': annual_sharpe
         }
 
-        # print summary and weights (keeps backwards compatibility)
         print("" + "=" * 60)
         print("PORTFOLIO CHARACTERISTICS")
         print("=" * 60)
@@ -561,9 +496,6 @@ class MichaudOptimization:
 
         return weights_df, summary
 
-    # ---------------------------
-    # Summary stats
-    # ---------------------------
     def get_summary_statistics(self):
         if self.resampled_returns is None:
             raise ValueError("Must run run_resampled_optimization() first!")
@@ -623,9 +555,6 @@ class MichaudOptimization:
         print("=" * 60 + "")
         return df
 
-    # ---------------------------
-    # Best Sharpe within risk band (annual risk)
-    # ---------------------------
     def get_best_sharpe_within_risk_band(self, min_annual_risk=0.09, max_annual_risk=0.12):
         if self.resampled_returns is None:
             raise ValueError("Must run run_resampled_optimization() first!")
@@ -675,17 +604,12 @@ class MichaudOptimization:
             'sharpe': best_sharpe
         }
 
-    # ---------------------------
-    # Exports
-    # ---------------------------
     def export_resampled_frontier(self, path="resampled_frontier.csv"):
         if self.resampled_weights is None:
             raise ValueError("Must run run_resampled_optimization() first!")
         df = pd.DataFrame(self.resampled_weights, columns=self.asset_names)
-        # add performance columns (daily)
         df['daily_log_return'] = self.resampled_returns
         df['daily_risk'] = self.resampled_risks
-        # add annualized
         simple_returns = np.exp(self.resampled_returns + 0.5 * (self.resampled_risks ** 2)) - 1.0
         df['annual_return_simple'] = simple_returns * 252.0
         df['annual_risk_std'] = self.resampled_risks * np.sqrt(252.0)
@@ -706,13 +630,8 @@ class MichaudOptimization:
         return path
 
 
-# ---------------------------
-# Example usage (entry point)
-# ---------------------------
 if __name__ == "__main__":
-    # tickers of interest (example)
     preferred_tickers = ["ARGX", "COCO", "GTX", "BZ", "INVA", "ERIC", "GBDC", "KRYS", "CALM", "CART", "ARLP", "GLPI", "IEF", "TIP", "TLT"]
-    # compute 5-year window using today's date (explicit 5-year window)
     end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
     start_date = (pd.Timestamp.today() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
 
@@ -733,10 +652,9 @@ if __name__ == "__main__":
         np.random.seed(42)
         dates = pd.date_range(start=start_date, end=end_date, freq='D')
         num_days = len(dates)
-        # generate 15 assets synthetic returns
         mu = np.full(15, 0.00045)
         vol = np.linspace(0.015, 0.035, 15)
-        corr = 0.3 + 0.4 * np.eye(15)  # simple-ish
+        corr = 0.3 + 0.4 * np.eye(15)  
         cov = np.outer(vol, vol) * 0.2 + np.diag(vol**2) * 0.8
         returns = np.random.multivariate_normal(mu, cov, size=num_days)
         returns_df = pd.DataFrame(returns, index=dates, columns=preferred_tickers)
@@ -748,21 +666,17 @@ if __name__ == "__main__":
 
     m = MichaudOptimization(
         returns_data=returns_df,
-        num_simulations=500,   # reduce for speed/demo
+        num_simulations=500,   
         num_portfolios=120,
         risk_free_rate=0.0125,
         random_state=42
     )
 
-    # run the resampled optimization (this is the heavy step)
     m.run_resampled_optimization(verbose=True)
     m.get_summary_statistics()
 
-    # Plot results including CML and moderate-risk band (9%-12%)
     m.plot_efficient_frontiers(show_traditional=True, show_cml=True, moderate_risk_band=(0.09, 0.12))
 
-    # Get unconstrained max-Sharpe (tangent) portfolio (choose by max sharpe computed from resampled frontier)
-    # We pick index with max annual Sharpe:
     simple_returns = np.exp(m.resampled_returns + 0.5 * (m.resampled_risks**2)) - 1.0
     annual_returns = simple_returns * 252.0
     annual_risks = m.resampled_risks * np.sqrt(252.0)
@@ -775,18 +689,15 @@ if __name__ == "__main__":
     print("=" * 60)
     m.get_portfolio_weights(target_risk=None, target_return=m.resampled_returns[max_sharpe_idx])
 
-    # Minimum-variance portfolio
     min_risk_idx = int(np.argmin(m.resampled_risks))
     print("" + "=" * 60)
     print("MINIMUM RISK PORTFOLIO")
     print("=" * 60)
     m.get_portfolio_weights(target_risk=m.resampled_risks[min_risk_idx])
 
-    # Best Sharpe inside moderate risk band 9%-12% annual
     best_mod = m.get_best_sharpe_within_risk_band(min_annual_risk=0.09, max_annual_risk=0.12)
     if best_mod is None:
         print("No feasible moderate-risk portfolio found inside the band.")
-        # compute CML levered portfolio at midpoint and export
         levered = m.compute_levered_tangent_portfolio(0.5*(0.09+0.12))
         path = "best_moderate_portfolio_levered.csv"
         levered['weights_df'].to_csv(path, index=False)
